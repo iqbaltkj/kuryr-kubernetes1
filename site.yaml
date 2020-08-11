@@ -1,0 +1,132 @@
+---
+- name: Launch k8s master
+  hosts: localhost
+  pre_tasks:
+    - name: create network
+      os_network:
+        name: "{{ name }}"
+
+    - name: create subnet
+      os_subnet:
+        network_name: "{{ network_name }}"
+        name: "{{ subnet_name }}"
+        cidr: "{{ subnet_cidr }}"
+        dns_nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+      register: subnet
+
+    - name: create router
+      os_router:
+        name: "{{ router_name }}"
+        network: "{{ external_network_name }}"
+        interfaces:
+          - "{{ network_name }}"
+      register: router
+
+    - name: Set variables
+      set_fact:
+        state: present
+        routeruuid: "{{ router.id }}"
+        subnetuuid: "{{ subnet.id }}"
+  roles:
+    - openstack-security-groups
+    - openstack-master
+
+- name: Launch k8s nodes
+  hosts: localhost
+  roles:
+    - openstack-nodes
+
+- name: Master preparation
+  hosts: master
+  pre_tasks:
+    - name: Set variables
+      set_fact:
+        state: present
+  tags:
+    - bootstrap
+  gather_facts: false
+  roles:
+    - common
+
+- name: Nodes preparation
+  hosts: nodes
+  tags:
+    - bootstrap
+  gather_facts: false
+  roles:
+    - common
+
+- name: Install repo and packages
+  hosts: all
+  tags:
+    - bootstrap
+  become: true
+  roles:
+    - kubeadm
+
+# ------------------------------- START WORKAROUNDS ----------------------------------------
+
+#- name: WORKAROUND for iptables >= 1.8, cf. https://github.com/kubernetes/kubernetes/issues/71305
+#  hosts: all
+#  tasks:
+#    - name: bla
+#      shell: |
+#        update-alternatives --set iptables /usr/sbin/iptables-legacy
+#        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+#        update-alternatives --set arptables /usr/sbin/arptables-legacy
+#        update-alternatives --set ebtables /usr/sbin/ebtables-legacy
+
+- name: WORKAROUND for networking to work with kubenet
+  hosts: all
+  become: true
+  tasks:
+    - name: Set policy ACCEPT on chain FORWARD (cf. https://github.com/projectcalico/calico/issues/1840)
+      shell: iptables -P FORWARD ACCEPT
+
+# ------------------------------- END WORKAROUNDS ----------------------------------------
+
+- name: k8s master setup
+  hosts: master
+  tags:
+    - bootstrap
+  become: true
+  roles:
+    - kubeadm-master
+
+- name: k8s nodes setup
+  hosts: nodes
+  become: true
+  pre_tasks:
+    - name: Set variables
+      set_fact:
+        state: present
+  tags:
+    - bootstrap
+  roles:
+    - kubeadm-nodes
+
+- name: k8s rbac
+  hosts: master
+  tags:
+    - bootstrap
+  roles:
+    - k8s-rbac
+
+- name: k8s addons
+  hosts: master
+  tags:
+    - bootstrap
+  roles:
+    - k8s-addons
+
+- name: Health check
+  hosts: master
+  roles:
+    - healthcheck
+
+- name: Local kubectl configuration
+  hosts: master
+  roles:
+    - kubectl

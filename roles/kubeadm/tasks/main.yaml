@@ -1,0 +1,99 @@
+- name: Install k8s APT repo GPG key
+  apt_key:
+    url: "https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+    state: present
+
+- name: Setup k8s APT repo
+  apt_repository:
+    repo: deb http://apt.kubernetes.io/ kubernetes-xenial main
+    state: present
+
+# TODO Make this idempotent (cf. https://github.com/ansible/ansible/issues/18889)
+- name: Unhold docker and kubernetes packages
+  command: "apt-mark unhold {{ item }}"
+  with_items:
+    - docker.io
+    - kubelet
+    - kubeadm
+    - kubectl
+    - kubernetes-cni
+
+- name: Install docker and kubernetes packages
+  apt:
+    name:
+      [
+        "docker.io={{ docker_version }}",
+        "kubelet={{ kubernetes_ubuntu_version }}",
+        "kubeadm={{ kubernetes_ubuntu_version }}",
+        "kubectl={{ kubernetes_ubuntu_version }}",
+        "kubernetes-cni={{ kubernetes_cni_ubuntu_version }}",
+      ]
+    state: present
+    update_cache: yes
+
+- name: Enable docker service
+  systemd:
+    name: docker
+    enabled: yes
+    daemon_reload: yes
+
+- name: Hold docker and kubernetes packages
+  command: "apt-mark hold {{ item }}"
+  with_items:
+    - docker.io
+    - kubelet
+    - kubeadm
+    - kubectl
+    - kubernetes-cni
+
+- name: configure docker to use journald
+  copy:
+    content: |
+      {
+        "exec-opts": [
+          "native.cgroupdriver=systemd"
+        ],
+        "log-driver": "journald",
+        "storage-driver": "overlay2"
+      }
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: 0644
+  notify:
+    - Restart docker
+
+- name: dont write docker logs to /var/log/syslog
+  copy:
+    content: |
+      if $programname == 'dockerd' or $syslogtag == 'dockerd' then /dev/null
+      & stop
+    dest: "/etc/rsyslog.d/30-docker.conf"
+    mode: 0644
+    owner: root
+    group: root
+  notify:
+    - Restart rsyslog
+
+- name: add hosts
+  lineinfile:
+    dest: "/etc/hosts"
+    regexp: ".*{{ hostvars[item].ansible_hostname }}$"
+    line: "{{ hostvars[item].ansible_default_ipv4.address }} {{ hostvars[item].ansible_hostname }}"
+    state: present
+  when: hostvars[item].ansible_hostname is defined
+  with_items: "{{groups['all'] | default([])}}"
+
+- name: Create OpenStack cloud configuration
+  template:
+    src: files/cloud-config.j2
+    dest: /etc/kubernetes/cloud-config
+    mode: 0600
+
+- name: Override default kubeadm configuration to use the OpenStack cloud configuration
+  copy:
+    src: files/10-kubeadm.conf
+    dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    mode: 0600
+  notify:
+    - Restart kubelet

@@ -1,0 +1,304 @@
+- name: Check for existing kubelet configuration
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+- name: Create kubeadm config file
+  template:
+    src: files/kubeadm-init.yaml.j2
+    dest: /etc/kubeadm-init.conf.yaml
+    mode: 0600
+  when: state == "present"
+
+- name: Upload the openstack-cloud-controller-manager pod descriptor
+  template:
+    src: files/openstack-cloud-controller-manager-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/openstack-cloud-controller-manager-pod.yaml
+    mode: 0600
+  when: state == "present"
+
+- name: Ensure /etc/kubernetes/pki/ directory is present
+  become: True
+  file:
+    path: /etc/kubernetes/pki/
+    state: directory
+    owner: root
+    group: root
+    mode: 0700
+  when: state == "present"
+
+- name: Upload webook kubeconfig file
+  copy:
+    dest: /etc/kubernetes/pki/webhook.kubeconfig.yaml
+    src: files/webhook.kubeconfig.yaml
+  when: state == "present"
+
+- name: mod prob
+  command: "sudo modprobe br_netfilter"
+  when:
+    - state == "present"
+
+- name: enable service docker
+  systemd:
+    name: docker
+    enabled: yes
+    masked: no
+
+- name: enable service kubelet
+  systemd:
+    name: kubelet
+    enabled: yes
+    masked: no
+
+- name: Run kubeadm init
+  command: "kubeadm init --config /etc/kubeadm-init.conf.yaml"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  when:
+    - state == "present"
+    - kubelet_conf.stat.exists == False
+
+- name: Ensure kubectl configuration directory is present
+  become: True
+  file:
+    path: $HOME/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: 0700
+  when: state == "present"
+
+- name: Copy kubectl configuration for the default user
+  become: True
+  copy:
+    remote_src: True
+    src: /etc/kubernetes/admin.conf
+    dest: $HOME/ubuntu/.kube/config
+    owner: ubuntu
+    group: ubuntu
+    mode: 0600
+  when: state == "present"
+
+- name: Run kubeadm init
+  command: "kubectl taint nodes --all node-role.kubernetes.io/master-"
+  when:
+    - state == "present"
+
+- name: Install package
+  apt:
+    name: gcc g++ python3-dev python3-pip git crudini
+    state: present
+
+# belum pakai branch stable/ussuri
+- git:
+    repo: 'http://git.openstack.org/openstack/kuryr-kubernetes'
+    dest: /root/kuryr-kubernetes
+    version: stable/ussuri
+
+- pip:
+    name: kuryr-kubernetes
+    executable: pip3
+    extra_args: -e
+    chdir: $HOME/ubuntu
+
+- name: Generate config tools
+  shell:
+    cmd: $HOME/tools/generate_config_file_samples.sh
+
+- name: Creates directory kuryr config
+  file:
+    path: /etc/kuryr
+    state: directory
+
+- name: Copy Kuryr config file
+  copy:
+    src: $HOME/ubuntu/kuryr-kubernetes
+    dest: /etc/kuryr/kuryr.conf
+    follow: yes
+
+- name: Run Kubelet proxy
+  shell:
+    cmd: 
+      - KUBEAPI=ip a s ens3 | awk -F"[/ ]+" '/inet / {print $3}'
+      - kubectl proxy --port=8080 --address=$KUBEAPI --accept-hosts='^.*' &
+  when: state == "present"
+  
+- name: Run Kubelet proxy
+  shell:
+    cmd:
+      - PASS=$pass
+      - AUTH_URL=$auth_url
+      - EXTERNAL_NET=$external_net
+      - SECGROUP=$secgroup
+      - EXTERNAL_SUBNET=$external_subnet
+      - SERVICE_SUBNET=$service_subnet
+      - POD_SUBNET=$pod_subnet
+      - PROJECT=$project
+      - USERNAME=$username
+      - KUBE_SUBNET=$kube_subnet
+      - PROJECT_NAME=$project_name
+  when: state == "present"
+
+- name: Crudini set kuryr config file
+  shell:
+    cmd:
+      - crudini --set /etc/kuryr/kuryr.conf kubernetes api_root http://$KUBEAPI:8080
+      - crudini --set /etc/kuryr/kuryr.conf DEFAULT use_stderr true
+      - crudini --set /etc/kuryr/kuryr.conf DEFAULT lock_path /var/kuryr-lock
+      - crudini --set /etc/kuryr/kuryr.conf DEFAULT bindir /usr/local/libexec/kuryr
+      - crudini --set /etc/kuryr/kuryr.conf neutron username $USERNAME
+      - crudini --set /etc/kuryr/kuryr.conf neutron user_domain_name Default
+      - crudini --set /etc/kuryr/kuryr.conf neutron password $PASS
+      - crudini --set /etc/kuryr/kuryr.conf neutron project_name $PROJECT_NAME
+      - crudini --set /etc/kuryr/kuryr.conf neutron project_domain_name Default
+      - crudini --set /etc/kuryr/kuryr.conf neutron auth_type password
+      - crudini --set /etc/kuryr/kuryr.conf neutron auth_url $AUTH_URL
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults ovs_bridge br-int
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults external_svc_net $EXTERNAL_NET
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults pod_security_groups $SECGROUP
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults external_svc_subnet $EXTERNAL_SUBNET
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults service_subnet $SERVICE_SUBNET
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults pod_subnet $POD_SUBNET
+      - crudini --set /etc/kuryr/kuryr.conf neutron_defaults project $PROJECT
+      - crudini --set /etc/kuryr/kuryr.conf cni_daemon docker_mode true
+      - crudini --set /etc/kuryr/kuryr.conf cni_daemon netns_proc_dir /host_proc
+      - crudini --set /etc/kuryr/kuryr.conf vif_plug_ovs_privileged helper_command privsep-helper
+      - crudini --set /etc/kuryr/kuryr.conf vif_plug_linux_bridge_privileged helper_command privsep-helper
+      - crudini --set /etc/kuryr/kuryr.conf pod_vif_nested worker_nodes_subnet $KUBE_SUBNET
+      - crudini --set /etc/kuryr/kuryr.conf kubernetes pod_vif_driver nested-vlan
+      - crudini --set /etc/kuryr/kuryr.conf binding default_driver kuryr.lib.binding.drivers.vlan
+      - crudini --set /etc/kuryr/kuryr.conf binding link_iface ens3
+  when: state == "present"
+
+- name: Kubectl apply CRD
+  shell:
+    cmd:
+      - kubectl apply -f $HOME/kubernetes_crds/network_attachment_definition_crd.yaml 
+  when: state == "present"
+
+- name: kubectl apply other kuryr_crds
+  shell:
+    cmd:
+      - kubectl apply -f $HOME/kuryr-kubernetes/kubernetes_crds/kuryr_crds/kuryrloadbalancer.yaml 
+      - kubectl apply -f $HOME/kuryr-kubernetes/kubernetes_crds/kuryr_crds/kuryrnet
+      - kubectl apply -f $HOME/kuryr-kubernetes/kubernetes_crds/kuryr_crds/kuryrnetpolicy.yaml 
+      - kubectl apply -f $HOME/kuryr-kubernetes/kubernetes_crds/kuryr_crds/kuryrnetwork.yaml 
+      - kubectl apply -f $HOME/kuryr-kubernetes/kubernetes_crds/kuryr_crds/kuryrnet.yaml 
+
+- name: generate k8s resource definitions
+  shell:
+    cmd:
+      - bash $HOME/kuryr-kubernetes/tools/generate_k8s_resource_definitions.sh /tmp/ /etc/kuryr/kuryr.conf 
+
+- name: generate k8s resource definitions
+  shell:
+    cmd:
+      - kubectl apply -f /tmp/config_map.yml -n kube-system
+      - kubectl apply -f /tmp/certificates_secret.yml -n kube-system
+      - kubectl apply -f /tmp/service_account.yml -n kube-system
+
+- name: Pull Kuryr Controller image
+  docker_image:
+    name: 5thphase/kuryr:controller-u
+    source: pull
+
+- name: Pull Kuryr CNI image
+  docker_image:
+    name: 5thphase/kuryr:cni-u
+    source: pull
+
+- name: Tag kuryr controller image
+  docker_image:
+    name: 5thphase/kuryr:controller-u
+    repository: kuryr/controller:latest
+    force_tag: yes
+    source: local
+
+- name: Tag kuryr cni image
+  docker_image:
+    name: 5thphase/kuryr:cni-u
+    repository: kuryr/cni:latest
+    force_tag: yes
+    source: local
+
+# asumsi cni_ds.yml sama controller_deployment.yml sudah diupdate
+
+- name: Run kubeadm reset (on destroy)
+  shell: "kubeadm reset --force"
+  when:
+    - state == "absent"
+    - kubelet_conf.stat.exists == True
+
+- name: Generate a join token
+  command: kubeadm token create --print-join-command
+  register: joincommand
+  when: state == "present"
+
+- name: Set fact joincommand
+  set_fact:
+    joincommand: "{{ joincommand.stdout }}"
+  when: state == "present"
+
+- name: In case of upgrade make sure container versions are right for kube-apiserver
+  replace:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    regexp: v1.[0-9]{1,2}.[0-9]{1,2}
+    replace: "{{ kubernetes_version }}"
+  when: state == "present"
+
+- name: In case of upgrade make sure container versions are right for kube-controller-manager
+  replace:
+    path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    regexp: v1.[0-9]{1,2}.[0-9]{1,2}
+    replace: "{{ kubernetes_version }}"
+  when: state == "present"
+
+- name: In case of upgrade make sure container versions are right for kube-scheduler
+  replace:
+    path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    regexp: v1.[0-9]{1,2}.[0-9]{1,2}
+    replace: "{{ kubernetes_version }}"
+  when: state == "present"
+
+- name: Check for existing kubectl bash completion
+  stat:
+    path: /etc/bash_completion.d/kubectl
+  register: kubectl_bash_completion
+
+- name: Ensure kubectl bash_completion is present
+  become: True
+  shell: kubectl completion bash > /etc/bash_completion.d/kubectl
+  when:
+    - kubectl_bash_completion.stat.exists == False
+    - state == "present"
+
+- name: Check for existing kubectx
+  stat:
+    path: /opt/kubectx/kubectx
+  register: kubectx
+
+- name: Clone kubectx repo
+  git:
+    repo: https://github.com/ahmetb/kubectx
+    dest: /opt/kubectx
+  when:
+    - kubectx.stat.exists == False
+    - state == "present"
+
+- name: Link kubectx
+  file:
+    state: link
+    src: /opt/kubectx/kubectx
+    dest: /usr/local/bin/kubectx
+  when:
+    - kubectx.stat.exists == False
+    - state == "present"
+
+- name: Link kubens
+  file:
+    state: link
+    src: /opt/kubectx/kubens
+    dest: /usr/local/bin/kubens
+  when:
+    - kubectx.stat.exists == False
+    - state == "present"
